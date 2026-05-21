@@ -1,20 +1,27 @@
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import path from "path"
-import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Layer, Context } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { Config } from "@/config/config"
+import * as ConfigMarkdown from "@/config/markdown"
+import * as Log from "@opencode-ai/core/util/log"
 import { InstanceState } from "@/effect/instance-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { FSUtil } from "@opencode-ai/core/fs-util"
+import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { Global } from "@opencode-ai/core/global"
 import type { MessageV2 } from "./message-v2"
 import type { MessageID } from "./schema"
 
-function extract(messages: SessionV1.WithParts[]) {
+const log = Log.create({ service: "instruction" })
+
+const files = (disableClaudeCodePrompt: boolean) => [
+  "AGENTS.md",
+  ...(disableClaudeCodePrompt ? [] : ["CLAUDE.md"]),
+  "CONTEXT.md", // deprecated
+]
+
+function extract(messages: MessageV2.WithParts[]) {
   const paths = new Set<string>()
   for (const msg of messages) {
     for (const part of msg.parts) {
@@ -33,27 +40,27 @@ function extract(messages: SessionV1.WithParts[]) {
 
 export interface Interface {
   readonly clear: (messageID: MessageID) => Effect.Effect<void>
-  readonly systemPaths: () => Effect.Effect<Set<string>, FSUtil.Error>
-  readonly system: () => Effect.Effect<string[], FSUtil.Error>
-  readonly find: (dir: string) => Effect.Effect<string | undefined, FSUtil.Error>
+  readonly systemPaths: () => Effect.Effect<Set<string>, AppFileSystem.Error>
+  readonly system: () => Effect.Effect<string[], AppFileSystem.Error>
+  readonly find: (dir: string) => Effect.Effect<string | undefined, AppFileSystem.Error>
   readonly resolve: (
-    messages: SessionV1.WithParts[],
+    messages: MessageV2.WithParts[],
     filepath: string,
     messageID: MessageID,
-  ) => Effect.Effect<{ filepath: string; content: string }[], FSUtil.Error>
+  ) => Effect.Effect<{ filepath: string; content: string }[], AppFileSystem.Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Instruction") {}
 
-const layer: Layer.Layer<
+export const layer: Layer.Layer<
   Service,
   never,
-  FSUtil.Service | Config.Service | Global.Service | HttpClient.HttpClient | RuntimeFlags.Service
+  AppFileSystem.Service | Config.Service | Global.Service | HttpClient.HttpClient | RuntimeFlags.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
     const cfg = yield* Config.Service
-    const fs = yield* FSUtil.Service
+    const fs = yield* AppFileSystem.Service
     const global = yield* Global.Service
     const flags = yield* RuntimeFlags.Service
     const http = HttpClient.filterStatusOk(withTransientReadRetry(yield* HttpClient.HttpClient))
@@ -61,11 +68,7 @@ const layer: Layer.Layer<
       path.join(global.config, "AGENTS.md"),
       ...(!flags.disableClaudeCodePrompt ? [path.join(global.home, ".claude", "CLAUDE.md")] : []),
     ]
-    const instructionFiles = [
-      "AGENTS.md",
-      ...(!flags.disableClaudeCodePrompt ? ["CLAUDE.md"] : []),
-      "CONTEXT.md", // deprecated
-    ]
+    const instructionFiles = files(flags.disableClaudeCodePrompt)
 
     const state = yield* InstanceState.make(
       Effect.fn("Instruction.state")(() =>
@@ -89,7 +92,12 @@ const layer: Layer.Layer<
     })
 
     const read = Effect.fnUntraced(function* (filepath: string) {
-      return yield* fs.readFileString(filepath).pipe(Effect.catch(() => Effect.succeed("")))
+      const raw = yield* fs.readFileString(filepath).pipe(Effect.catch(() => Effect.succeed("")))
+      const result = yield* Effect.promise(() => ConfigMarkdown.interpolateFiles(raw, path.dirname(filepath)))
+      for (const err of result.errors) {
+        log.warn("instruction file interpolation failed", { type: err.type, refPath: err.refPath, file: filepath })
+      }
+      return result.content
     })
 
     const fetch = Effect.fnUntraced(function* (url: string) {
@@ -177,7 +185,7 @@ const layer: Layer.Layer<
     })
 
     const resolve = Effect.fn("Instruction.resolve")(function* (
-      messages: SessionV1.WithParts[],
+      messages: MessageV2.WithParts[],
       filepath: string,
       messageID: MessageID,
     ) {
@@ -224,14 +232,16 @@ const layer: Layer.Layer<
   }),
 )
 
-export function loaded(messages: SessionV1.WithParts[]) {
+export const defaultLayer = layer.pipe(
+  Layer.provide(Config.defaultLayer),
+  Layer.provide(Global.layer),
+  Layer.provide(AppFileSystem.defaultLayer),
+  Layer.provide(FetchHttpClient.layer),
+  Layer.provide(RuntimeFlags.defaultLayer),
+)
+
+export function loaded(messages: MessageV2.WithParts[]) {
   return extract(messages)
 }
-
-export const node = LayerNode.make({
-  service: Service,
-  layer: layer,
-  deps: [Config.node, FSUtil.node, Global.node, RuntimeFlags.node, httpClient],
-})
 
 export * as Instruction from "./instruction"

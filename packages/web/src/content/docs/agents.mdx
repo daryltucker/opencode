@@ -217,6 +217,59 @@ The markdown file name becomes the agent name. For example, `review.md` creates 
 
 ---
 
+### File Interpolation
+
+Agent markdown files support `{file:...}` syntax to include content from other files. This enables modular prompt composition and shared documentation across agents.
+
+```markdown title="~/.config/opencode/agents/planning.md"
+---
+description: Planning Oracle
+mode: primary
+---
+
+# Planning Oracle
+
+{file:../docs/creed.md}
+
+## Guidelines
+
+{file:./common/juggling.md}
+{file:./common/foundation.md}
+```
+
+The `{file:...}` references are resolved at load time and replaced with the file contents.
+
+**Path resolution:**
+
+| Path | Resolved relative to |
+|------|---------------------|
+| `./common/juggling.md` | The directory containing the agent file |
+| `../docs/creed.md` | Parent directory of the agent file |
+| `/absolute/path.md` | Absolute filesystem path |
+| `~/home/path.md` | User's home directory |
+
+**Included files are also recursively interpolated**, so a shared file can itself include other files. Circular references and excessive nesting are handled gracefully:
+
+- **Circular reference** → replaced with `<!-- Circular file reference: ... -->`
+- **Max depth exceeded** (default: 5) → replaced with `<!-- Max include depth exceeded: ... -->`
+- **File not found** → replaced with `<!-- File not found: ... -->` and logged as a warning
+
+Frontmatter is stripped from included files — only the markdown body is inserted. This prevents frontmatter from nested agent files from affecting the parent agent's configuration.
+
+The `{file:...}` syntax also works in the `prompt` field of JSON config:
+
+```json title="opencode.json"
+{
+  "agent": {
+    "review": {
+      "prompt": "{file:./prompts/code-review.txt}"
+    }
+  }
+}
+```
+
+---
+
 ## Options
 
 Let's look at these configuration options in detail.
@@ -345,6 +398,8 @@ Specify a custom system prompt file for this agent with the `prompt` config. The
 ```
 
 This path is relative to where the config file is located. So this works for both the global OpenCode config and the project specific config.
+
+The `{file:...}` syntax interpolates file contents at load time. See [File Interpolation](#file-interpolation) for details on path resolution, recursive includes, and error handling.
 
 ---
 
